@@ -512,6 +512,549 @@ app.post('/auth/upload-avatar', upload.single('avatar'), async (req, res) => {
     }
 });
 
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ error: 'No token provided' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+};
+
+// HABITS CRUD OPERATIONS
+
+// Get all habits for the authenticated user with recent completion history
+app.get('/api/habits', authenticateToken, async (req, res) => {
+    try {
+        // Get habits
+        const { data: habits, error: habitsError } = await supabase
+            .from('habits')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .order('created_at', { ascending: false });
+
+        if (habitsError) {
+            console.error('Error fetching habits:', habitsError);
+            return res.status(500).json({ error: 'Failed to fetch habits' });
+        }
+
+        // Get last 60 days of completions for all habits (to support calendar view)
+        const sixtyDaysAgo = new Date();
+        sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+        const startDate = sixtyDaysAgo.toISOString().split('T')[0];
+
+        const { data: recentLogs, error: logsError } = await supabase
+            .from('habit_logs')
+            .select('habit_id, completed_date, notes')
+            .eq('user_id', req.user.id)
+            .gte('completed_date', startDate)
+            .order('completed_date', { ascending: false });
+
+        if (logsError) {
+            console.error('Error fetching recent logs:', logsError);
+            return res.status(500).json({ error: 'Failed to fetch completion history' });
+        }
+
+        // Attach recent logs to each habit
+        const habitsWithHistory = habits.map(habit => ({
+            ...habit,
+            recent_completions: recentLogs.filter(log => log.habit_id === habit.id)
+        }));
+
+        res.json({ habits: habitsWithHistory });
+    } catch (error) {
+        console.error('Error fetching habits:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get a single habit by ID
+app.get('/api/habits/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const { data: habit, error } = await supabase
+            .from('habits')
+            .select(`
+                *,
+                habit_logs (
+                    id,
+                    completed_at,
+                    notes
+                )
+            `)
+            .eq('id', id)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (error || !habit) {
+            return res.status(404).json({ error: 'Habit not found' });
+        }
+
+        res.json({ habit });
+    } catch (error) {
+        console.error('Error fetching habit:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create a new habit (daily only)
+app.post('/api/habits', authenticateToken, async (req, res) => {
+    try {
+        const { title, description, category, color } = req.body;
+
+        if (!title) {
+            return res.status(400).json({ error: 'Title is required' });
+        }
+
+        const { data: habit, error } = await supabase
+            .from('habits')
+            .insert([
+                {
+                    user_id: req.user.id,
+                    title: title.trim(),
+                    description: description?.trim() || null,
+                    category: category?.trim() || null,
+                    color: color || '#3B82F6',
+                    current_streak: 0,
+                    longest_streak: 0,
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString()
+                }
+            ])
+            .select()
+            .single();
+
+        if (error) {
+            console.error('Error creating habit:', error);
+            return res.status(500).json({ error: 'Failed to create habit' });
+        }
+
+        res.status(201).json({
+            message: 'Habit created successfully',
+            habit
+        });
+    } catch (error) {
+        console.error('Error creating habit:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update a habit
+app.put('/api/habits/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { title, description, category, color, is_active } = req.body;
+
+        // Verify habit belongs to user
+        const { data: existingHabit, error: fetchError } = await supabase
+            .from('habits')
+            .select('id')
+            .eq('id', id)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (fetchError || !existingHabit) {
+            return res.status(404).json({ error: 'Habit not found' });
+        }
+
+        const updateData = {
+            updated_at: new Date().toISOString()
+        };
+
+        if (title !== undefined) updateData.title = title.trim();
+        if (description !== undefined) updateData.description = description?.trim() || null;
+        if (category !== undefined) updateData.category = category?.trim() || null;
+        if (color !== undefined) updateData.color = color;
+        if (is_active !== undefined) updateData.is_active = is_active;
+
+        const { data: habit, error } = await supabase
+            .from('habits')
+            .update(updateData)
+            .eq('id', id)
+            .eq('user_id', req.user.id)
+            .select()
+            .single();
+
+        if (error) {
+            console.error('Error updating habit:', error);
+            return res.status(500).json({ error: 'Failed to update habit' });
+        }
+
+        res.json({
+            message: 'Habit updated successfully',
+            habit
+        });
+    } catch (error) {
+        console.error('Error updating habit:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete a habit (soft delete by setting is_active to false)
+app.delete('/api/habits/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Verify habit belongs to user
+        const { data: existingHabit, error: fetchError } = await supabase
+            .from('habits')
+            .select('id')
+            .eq('id', id)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (fetchError || !existingHabit) {
+            return res.status(404).json({ error: 'Habit not found' });
+        }
+
+        const { error } = await supabase
+            .from('habits')
+            .update({
+                is_active: false,
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', id)
+            .eq('user_id', req.user.id);
+
+        if (error) {
+            console.error('Error deleting habit:', error);
+            return res.status(500).json({ error: 'Failed to delete habit' });
+        }
+
+        res.json({ message: 'Habit deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting habit:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Toggle daily habit completion
+app.post('/api/habits/:id/toggle', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { date, notes } = req.body;
+        
+        // Use provided date or today
+        const completionDate = date || new Date().toISOString().split('T')[0];
+
+        // Verify habit belongs to user and is active
+        const { data: habit, error: fetchError } = await supabase
+            .from('habits')
+            .select('*')
+            .eq('id', id)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (fetchError || !habit) {
+            return res.status(404).json({ error: 'Habit not found' });
+        }
+
+        if (!habit.is_active) {
+            return res.status(400).json({ error: 'Cannot toggle completion for inactive habit' });
+        }
+
+        // Check if already completed for this date
+        const { data: existingLog, error: checkError } = await supabase
+            .from('habit_logs')
+            .select('id')
+            .eq('habit_id', id)
+            .eq('user_id', req.user.id)
+            .eq('completed_date', completionDate)
+            .single();
+
+        let isCompleted = false;
+        let message = '';
+
+        if (existingLog) {
+            // Remove completion
+            const { error: deleteError } = await supabase
+                .from('habit_logs')
+                .delete()
+                .eq('id', existingLog.id);
+
+            if (deleteError) {
+                console.error('Error removing completion:', deleteError);
+                return res.status(500).json({ error: 'Failed to remove completion' });
+            }
+
+            message = 'Habit completion removed';
+            isCompleted = false;
+        } else {
+            // Add completion
+            const { error: insertError } = await supabase
+                .from('habit_logs')
+                .insert([
+                    {
+                        habit_id: id,
+                        user_id: req.user.id,
+                        completed_date: completionDate,
+                        notes: notes?.trim() || null,
+                        created_at: new Date().toISOString()
+                    }
+                ]);
+
+            if (insertError) {
+                console.error('Error adding completion:', insertError);
+                return res.status(500).json({ error: 'Failed to add completion' });
+            }
+
+            message = 'Habit completion added';
+            isCompleted = true;
+        }
+
+        // Recalculate streaks
+        await calculateStreaks(id, req.user.id);
+
+        res.json({
+            message,
+            isCompleted,
+            date: completionDate
+        });
+    } catch (error) {
+        console.error('Error toggling habit completion:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Helper function to calculate streaks
+async function calculateStreaks(habitId, userId) {
+    try {
+        // Get all completions for this habit, ordered by date
+        const { data: logs, error } = await supabase
+            .from('habit_logs')
+            .select('completed_date')
+            .eq('habit_id', habitId)
+            .eq('user_id', userId)
+            .order('completed_date', { ascending: false });
+
+        if (error) {
+            console.error('Error fetching logs for streak calculation:', error);
+            return;
+        }
+
+        let currentStreak = 0;
+        let longestStreak = 0;
+        let tempStreak = 0;
+
+        if (logs.length > 0) {
+            const today = new Date();
+            const todayStr = today.toISOString().split('T')[0];
+            const yesterdayStr = new Date(today.getTime() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+            // Calculate current streak (must include today or yesterday to be current)
+            const sortedDates = logs.map(log => log.completed_date).sort((a, b) => new Date(b) - new Date(a));
+            
+            // Check if streak is current (includes today or yesterday)
+            if (sortedDates[0] === todayStr || sortedDates[0] === yesterdayStr) {
+                let checkDate = new Date(sortedDates[0]);
+                
+                for (const dateStr of sortedDates) {
+                    const logDate = new Date(dateStr);
+                    const expectedDate = checkDate.toISOString().split('T')[0];
+                    
+                    if (dateStr === expectedDate) {
+                        currentStreak++;
+                        checkDate.setDate(checkDate.getDate() - 1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Calculate longest streak
+            const allDates = sortedDates.sort((a, b) => new Date(a) - new Date(b));
+            
+            for (let i = 0; i < allDates.length; i++) {
+                if (i === 0) {
+                    tempStreak = 1;
+                } else {
+                    const prevDate = new Date(allDates[i - 1]);
+                    const currDate = new Date(allDates[i]);
+                    const diffDays = Math.floor((currDate - prevDate) / (1000 * 60 * 60 * 24));
+                    
+                    if (diffDays === 1) {
+                        tempStreak++;
+                    } else {
+                        longestStreak = Math.max(longestStreak, tempStreak);
+                        tempStreak = 1;
+                    }
+                }
+            }
+            longestStreak = Math.max(longestStreak, tempStreak);
+        }
+
+        // Update habit with new streak values
+        await supabase
+            .from('habits')
+            .update({
+                current_streak: currentStreak,
+                longest_streak: Math.max(longestStreak, currentStreak),
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', habitId)
+            .eq('user_id', userId);
+
+    } catch (error) {
+        console.error('Error calculating streaks:', error);
+    }
+}
+
+// Get habit logs for a specific habit
+app.get('/api/habits/:id/logs', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { limit = 50, offset = 0 } = req.query;
+
+        // Verify habit belongs to user
+        const { data: habit, error: fetchError } = await supabase
+            .from('habits')
+            .select('id')
+            .eq('id', id)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (fetchError || !habit) {
+            return res.status(404).json({ error: 'Habit not found' });
+        }
+
+        const { data: logs, error } = await supabase
+            .from('habit_logs')
+            .select('*')
+            .eq('habit_id', id)
+            .eq('user_id', req.user.id)
+            .order('completed_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (error) {
+            console.error('Error fetching habit logs:', error);
+            return res.status(500).json({ error: 'Failed to fetch habit logs' });
+        }
+
+        res.json({ logs });
+    } catch (error) {
+        console.error('Error fetching habit logs:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete a habit log
+app.delete('/api/habits/:habitId/logs/:logId', authenticateToken, async (req, res) => {
+    try {
+        const { habitId, logId } = req.params;
+
+        // Verify log belongs to user and habit
+        const { data: log, error: fetchError } = await supabase
+            .from('habit_logs')
+            .select('id')
+            .eq('id', logId)
+            .eq('habit_id', habitId)
+            .eq('user_id', req.user.id)
+            .single();
+
+        if (fetchError || !log) {
+            return res.status(404).json({ error: 'Habit log not found' });
+        }
+
+        const { error } = await supabase
+            .from('habit_logs')
+            .delete()
+            .eq('id', logId)
+            .eq('user_id', req.user.id);
+
+        if (error) {
+            console.error('Error deleting habit log:', error);
+            return res.status(500).json({ error: 'Failed to delete habit log' });
+        }
+
+        res.json({ message: 'Habit log deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting habit log:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create public share link
+app.post('/api/share/create', authenticateToken, async (req, res) => {
+    try {
+        const { settings, habits } = req.body;
+
+        // Generate unique share ID
+        const shareId = require('crypto').randomBytes(16).toString('hex');
+        
+        // Store share data in database (you'll need to create this table)
+        const shareData = {
+            id: shareId,
+            user_id: req.user.id,
+            settings: settings,
+            habits: habits,
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() // 30 days
+        };
+
+        // For now, we'll use a simple in-memory storage or file system
+        // In production, you'd want to create a 'shares' table in your database
+        const { data: share, error } = await supabase
+            .from('habit_shares')
+            .insert([shareData])
+            .select()
+            .single();
+
+        if (error) {
+            console.error('Error creating share:', error);
+            return res.status(500).json({ error: 'Failed to create share link' });
+        }
+
+        res.json({
+            shareId: shareId,
+            shareUrl: `${process.env.CLIENT_URL}/public/${shareId}`
+        });
+    } catch (error) {
+        console.error('Error creating share link:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get public share data
+app.get('/api/share/:shareId', async (req, res) => {
+    try {
+        const { shareId } = req.params;
+
+        const { data: share, error } = await supabase
+            .from('habit_shares')
+            .select('*')
+            .eq('id', shareId)
+            .single();
+
+        if (error || !share) {
+            return res.status(404).json({ error: 'Share not found' });
+        }
+
+        // Check if share has expired
+        if (new Date(share.expires_at) < new Date()) {
+            return res.status(404).json({ error: 'Share has expired' });
+        }
+
+        // Return share data without user info
+        res.json({
+            settings: share.settings,
+            habits: share.habits,
+            createdAt: share.created_at
+        });
+    } catch (error) {
+        console.error('Error fetching share data:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);

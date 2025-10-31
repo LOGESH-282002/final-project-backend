@@ -9,6 +9,8 @@
     "test-connection": "node test-connection.js",
     "setup-storage": "node setup-storage.js",
     "test-storage": "node test-storage.js",
+    "test-share-db": "node test-share-db.js",
+    "test-share-api": "node test-share-api.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -17,6 +19,7 @@
   "type": "commonjs",
   "dependencies": {
     "@supabase/supabase-js": "^2.78.0",
+    "axios": "^1.13.1",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
